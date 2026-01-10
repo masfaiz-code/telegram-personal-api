@@ -1,7 +1,8 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -51,12 +52,46 @@ class SendMessageResponse(BaseModel):
     error: Optional[str] = None
 
 
+class FromUser(BaseModel):
+    id: int
+    username: Optional[str] = None
+    first_name: str
+    is_bot: bool = False
+
+
 class MeResponse(BaseModel):
     id: int
     first_name: str
     last_name: Optional[str] = None
     username: Optional[str] = None
     phone_number: Optional[str] = None
+
+
+class MessageItem(BaseModel):
+    message_id: int
+    date: str
+    text: Optional[str] = None
+    from_user: Optional[FromUser] = None
+
+
+class GetMessagesResponse(BaseModel):
+    success: bool
+    chat_id: str
+    messages: List[MessageItem]
+    error: Optional[str] = None
+
+
+class ChatItem(BaseModel):
+    id: int
+    title: str
+    type: str
+    username: Optional[str] = None
+
+
+class GetChatsResponse(BaseModel):
+    success: bool
+    chats: List[ChatItem]
+    error: Optional[str] = None
 
 
 class ErrorResponse(BaseModel):
@@ -173,6 +208,98 @@ async def send_message(
         raise HTTPException(status_code=401, detail="Session expired or invalid")
     except Exception as e:
         logger.error(f"Unexpected error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/get-messages",
+    response_model=GetMessagesResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def get_messages(
+    chat_id: str,
+    limit: int = 20,
+    api_key: str = Depends(verify_api_key),
+):
+    try:
+        target_chat = chat_id
+        if target_chat.lstrip("-").isdigit():
+            target_chat = int(target_chat)
+
+        messages = []
+        async for msg in app_client.get_chat_history(chat_id=target_chat, limit=limit):
+            from_user = None
+            if msg.from_user:
+                from_user = FromUser(
+                    id=msg.from_user.id,
+                    username=msg.from_user.username,
+                    first_name=msg.from_user.first_name or "",
+                    is_bot=msg.from_user.is_bot or False,
+                )
+            messages.append(MessageItem(
+                message_id=msg.id,
+                date=msg.date.isoformat() if msg.date else "",
+                text=msg.text or msg.caption,
+                from_user=from_user,
+            ))
+
+        logger.info(f"Fetched {len(messages)} messages from {chat_id}")
+        return GetMessagesResponse(
+            success=True,
+            chat_id=chat_id,
+            messages=messages,
+        )
+    except PeerIdInvalid:
+        logger.error(f"Invalid chat_id: {chat_id}")
+        raise HTTPException(status_code=404, detail="Invalid chat_id or user not found")
+    except ChannelPrivate:
+        logger.error(f"Channel is private: {chat_id}")
+        raise HTTPException(status_code=403, detail="Cannot access private channel")
+    except Flood as e:
+        logger.error(f"Flood wait: {e.value} seconds")
+        raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
+    except Exception as e:
+        logger.error(f"Error fetching messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/get-chats",
+    response_model=GetChatsResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def get_chats(api_key: str = Depends(verify_api_key)):
+    try:
+        chats = []
+        async for dialog in app_client.get_dialogs(limit=50):
+            chat = dialog.chat
+            chats.append(ChatItem(
+                id=chat.id,
+                title=chat.title or chat.first_name or "Unknown",
+                type=str(chat.type).split(".")[-1].lower() if chat.type else "unknown",
+                username=chat.username,
+            ))
+
+        logger.info(f"Fetched {len(chats)} chats")
+        return GetChatsResponse(
+            success=True,
+            chats=chats,
+        )
+    except Flood as e:
+        logger.error(f"Flood wait: {e.value} seconds")
+        raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
+    except Exception as e:
+        logger.error(f"Error fetching chats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
