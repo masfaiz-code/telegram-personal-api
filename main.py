@@ -75,11 +75,27 @@ class ClickButtonRequest(BaseModel):
     button_data: Optional[str] = Field(None, description="Button callback data (exact match)")
 
 
+
 class ClickButtonResponse(BaseModel):
     success: bool
     chat_id: str
     message_id: int
     button_clicked: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ButtonItem(BaseModel):
+    text: str
+    callback_data: Optional[str] = None
+    url: Optional[str] = None
+
+
+class GetButtonsResponse(BaseModel):
+    success: bool
+    chat_id: str
+    message_id: int
+    has_keyboard: bool
+    buttons: List[List[ButtonItem]]
     callback_response: Optional[str] = None
     error: Optional[str] = None
 
@@ -271,6 +287,7 @@ async def info():
             "POST /send-message": "Send Telegram message",
             "GET /get-messages": "Fetch chat history",
             "POST /click-button": "Click inline keyboard button",
+            "GET /get-buttons": "Get inline keyboard buttons from a message",
             "GET /get-chats": "List all chats/groups",
             "GET /me": "Get connected account info"
         },
@@ -362,6 +379,19 @@ async def send_message(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def get_message_by_id(chat_id, message_id: int):
+    try:
+        messages = await app_client.get_messages(chat_id, message_id)
+        if messages:
+            return messages
+        return None
+    except Exception:
+        async for msg in app_client.get_chat_history(chat_id=chat_id, limit=20):
+            if msg.id == message_id:
+                return msg
+        return None
+
+
 @app.post(
     "/click-button",
     response_model=ClickButtonResponse,
@@ -388,16 +418,9 @@ async def click_button(
         if chat_id.lstrip("-").isdigit():
             chat_id = int(chat_id)
         
-        messages = []
-        async for msg in app_client.get_chat_history(chat_id=chat_id, limit=10):
-            if msg.id == request.message_id:
-                messages.append(msg)
-                break
-        
-        if not messages:
+        message = await get_message_by_id(chat_id, request.message_id)
+        if not message:
             raise HTTPException(status_code=404, detail="Message not found")
-        
-        message = messages[0]
         
         if not message.reply_markup:
             raise HTTPException(status_code=400, detail="Message has no inline keyboard")
@@ -448,6 +471,69 @@ async def click_button(
         raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
     except Exception as e:
         logger.error(f"Error clicking button: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/get-buttons",
+    response_model=GetButtonsResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def get_buttons(
+    chat_id: str,
+    message_id: int,
+    api_key: str = Depends(verify_api_key),
+):
+    try:
+        target_chat = chat_id
+        if target_chat.lstrip("-").isdigit():
+            target_chat = int(target_chat)
+        
+        message = await get_message_by_id(target_chat, message_id)
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        if not message.reply_markup or not hasattr(message.reply_markup, 'inline_keyboard'):
+            return GetButtonsResponse(
+                success=True,
+                chat_id=chat_id,
+                message_id=message_id,
+                has_keyboard=False,
+                buttons=[],
+            )
+        
+        buttons = []
+        for row in message.reply_markup.inline_keyboard:
+            button_row = []
+            for button in row:
+                button_row.append(ButtonItem(
+                    text=button.text,
+                    callback_data=button.callback_data,
+                    url=button.url,
+                ))
+            buttons.append(button_row)
+        
+        logger.info(f"Fetched {len(buttons)} button rows from message {message_id} in chat {chat_id}")
+        
+        return GetButtonsResponse(
+            success=True,
+            chat_id=chat_id,
+            message_id=message_id,
+            has_keyboard=True,
+            buttons=buttons,
+        )
+    except HTTPException:
+        raise
+    except PeerIdInvalid:
+        logger.error(f"Invalid chat_id: {chat_id}")
+        raise HTTPException(status_code=404, detail="Invalid chat_id or user not found")
+    except Exception as e:
+        logger.error(f"Error fetching buttons: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
