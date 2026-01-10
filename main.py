@@ -133,9 +133,24 @@ app = FastAPI(
 )
 
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+@app.get("/")
+async def root():
+    return {
+        "app_name": "Telegram Personal API By Mas Faiz Code",
+        "version": "1.0.0",
+        "status": "running",
+        "description": "REST API untuk mengirim pesan Telegram menggunakan akun personal",
+        "endpoints": {
+            "GET /": "API information",
+            "GET /docs": "Interactive API documentation (Swagger)",
+            "POST /send-message": "Send Telegram message",
+            "GET /get-messages": "Fetch chat history",
+            "GET /get-chats": "List all chats/groups",
+            "GET /me": "Get connected account info"
+        },
+        "authentication": "Bearer token required for all endpoints except /",
+        "github": "https://github.com/masfaiz-code/telegram-personal-api"
+    }
 
 
 @app.get(
