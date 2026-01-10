@@ -1,13 +1,17 @@
 import os
 import logging
+import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional, List
-from datetime import datetime
+from typing import Optional, List, Dict, Tuple
+from datetime import datetime, timedelta
+from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+import httpx
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from pyrogram import Client
+from pyrogram.handlers import MessageHandler
 from pyrogram.errors import (
     BadRequest,
     Unauthorized,
@@ -16,6 +20,7 @@ from pyrogram.errors import (
     UserNotParticipant,
     ChannelPrivate,
 )
+from pyrogram import filters
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,13 +36,24 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 API_KEY = os.getenv("API_KEY")
 
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+MONITOR_CHAT_IDS = os.getenv("MONITOR_CHAT_IDS", "")
+TRACK_EXPIRY_HOURS = int(os.getenv("TRACK_EXPIRY_HOURS", "24"))
+
 if not all([API_ID, API_HASH, SESSION_STRING, API_KEY]):
     raise ValueError(
         "Missing required environment variables: API_ID, API_HASH, SESSION_STRING, API_KEY"
     )
 
+monitor_chat_ids: List[int] = []
+if MONITOR_CHAT_IDS:
+    monitor_chat_ids = [int(cid.strip()) for cid in MONITOR_CHAT_IDS.split(",") if cid.strip()]
+
 security = HTTPBearer()
 app_client: Optional[Client] = None
+my_user_id: Optional[int] = None
+
+tracked_messages: Dict[int, List[Tuple[int, datetime]]] = defaultdict(list)
 
 
 class SendMessageRequest(BaseModel):
@@ -98,6 +114,87 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+async def cleanup_expired_tracking():
+    while True:
+        await asyncio.sleep(3600)
+        cutoff = datetime.now() - timedelta(hours=TRACK_EXPIRY_HOURS)
+        for chat_id in list(tracked_messages.keys()):
+            tracked_messages[chat_id] = [
+                (mid, ts) for mid, ts in tracked_messages[chat_id] if ts > cutoff
+            ]
+            if not tracked_messages[chat_id]:
+                del tracked_messages[chat_id]
+        logger.info("Cleaned up expired message tracking")
+
+
+async def send_webhook(payload: dict):
+    if not WEBHOOK_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(WEBHOOK_URL, json=payload)
+            logger.info(f"Webhook sent: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+
+
+async def handle_incoming_message(client, message):
+    global my_user_id
+    
+    if not WEBHOOK_URL:
+        return
+    
+    chat_id = message.chat.id
+    
+    if monitor_chat_ids and chat_id not in monitor_chat_ids:
+        return
+    
+    if not message.reply_to_message:
+        return
+    
+    reply_to_id = message.reply_to_message.id
+    reply_to_user_id = message.reply_to_message.from_user.id if message.reply_to_message.from_user else None
+    
+    is_reply_to_tracked = any(mid == reply_to_id for mid, ts in tracked_messages.get(chat_id, []))
+    is_reply_to_me = reply_to_user_id == my_user_id
+    
+    if not (is_reply_to_tracked or is_reply_to_me):
+        return
+    
+    payload = {
+        "event": "reply_received",
+        "timestamp": datetime.now().isoformat(),
+        "chat": {
+            "id": chat_id,
+            "title": message.chat.title or message.chat.first_name or "Unknown",
+            "type": str(message.chat.type).split(".")[-1].lower() if message.chat.type else "unknown"
+        },
+        "message": {
+            "id": message.id,
+            "text": message.text or message.caption,
+            "date": message.date.isoformat() if message.date else ""
+        },
+        "from_user": {
+            "id": message.from_user.id if message.from_user else None,
+            "username": message.from_user.username if message.from_user else None,
+            "first_name": message.from_user.first_name if message.from_user else None,
+            "is_bot": message.from_user.is_bot if message.from_user else False
+        },
+        "reply_to_message": {
+            "id": reply_to_id,
+            "text": message.reply_to_message.text or message.reply_to_message.caption,
+            "date": message.reply_to_message.date.isoformat() if message.reply_to_message.date else "",
+            "from_user": {
+                "id": reply_to_user_id,
+                "username": message.reply_to_message.from_user.username if message.reply_to_message.from_user else None
+            }
+        }
+    }
+    
+    logger.info(f"Reply detected in chat {chat_id}, forwarding to webhook")
+    await send_webhook(payload)
+
+
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     if credentials.credentials != API_KEY:
         logger.warning("Invalid API key attempt")
@@ -107,7 +204,8 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global app_client
+    global app_client, my_user_id
+    
     logger.info("Starting Pyrogram client...")
     app_client = Client(
         "telegram_api",
@@ -117,7 +215,16 @@ async def lifespan(app: FastAPI):
         in_memory=True,
     )
     await app_client.start()
+    
+    me = await app_client.get_me()
+    my_user_id = me.id
+    logger.info(f"Logged in as {me.first_name} (ID: {my_user_id})")
+    
+    app_client.add_handler(MessageHandler(handle_incoming_message, filters.incoming))
+    
+    cleanup_task = asyncio.create_task(cleanup_expired_tracking())
     logger.info("Pyrogram client started successfully")
+    
     yield
     logger.info("Stopping Pyrogram client...")
     if app_client:
@@ -127,26 +234,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram Personal API",
-    description="REST API for sending Telegram messages using personal account",
+    description="REST API untuk mengirim pesan Telegram menggunakan akun personal. By Mas Faiz Code.",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/",
+    redoc_url=None,
 )
 
 
-@app.get("/")
-async def root():
+@app.get("/info")
+async def info():
     return {
         "app_name": "Telegram Personal API By Mas Faiz Code",
         "version": "1.0.0",
         "status": "running",
         "description": "REST API untuk mengirim pesan Telegram menggunakan akun personal",
         "endpoints": {
-            "GET /": "API information",
-            "GET /docs": "Interactive API documentation (Swagger)",
+            "GET /": "Interactive API documentation (Swagger)",
+            "GET /info": "API information",
             "POST /send-message": "Send Telegram message",
             "GET /get-messages": "Fetch chat history",
             "GET /get-chats": "List all chats/groups",
             "GET /me": "Get connected account info"
+        },
+        "webhook": {
+            "enabled": bool(WEBHOOK_URL),
+            "monitored_chats": monitor_chat_ids or "all"
         },
         "authentication": "Bearer token required for all endpoints except /",
         "github": "https://github.com/masfaiz-code/telegram-personal-api"
@@ -190,15 +303,21 @@ async def send_message(
 ):
     try:
         chat_id = request.chat_id
+        original_chat_id = chat_id
         if chat_id.lstrip("-").isdigit():
             chat_id = int(chat_id)
 
         msg = await app_client.send_message(chat_id=chat_id, text=request.message)
+        
+        numeric_chat_id = msg.chat.id
+        tracked_messages[numeric_chat_id].append((msg.id, datetime.now()))
+        logger.info(f"Tracking message {msg.id} in chat {numeric_chat_id}")
+        
         logger.info(f"Message sent successfully to {request.chat_id}")
         return SendMessageResponse(
             success=True,
             message_id=msg.id,
-            chat_id=request.chat_id,
+            chat_id=original_chat_id,
         )
     except PeerIdInvalid:
         logger.error(f"Invalid chat_id: {request.chat_id}")
