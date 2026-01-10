@@ -381,11 +381,12 @@ async def send_message(
 
 async def get_message_by_id(chat_id, message_id: int):
     try:
-        messages = await app_client.get_messages(chat_id, message_id)
-        if messages:
-            return messages
+        message = await app_client.get_messages(chat_id, message_id)
+        if message:
+            return message
         return None
-    except Exception:
+    except Exception as e:
+        logger.warning(f"get_messages failed: {e}, falling back to get_chat_history")
         async for msg in app_client.get_chat_history(chat_id=chat_id, limit=20):
             if msg.id == message_id:
                 return msg
@@ -428,13 +429,19 @@ async def click_button(
         target_button = None
         for row in message.reply_markup.inline_keyboard:
             for button in row:
+                btn_callback_data = button.callback_data
+                if isinstance(btn_callback_data, bytes):
+                    btn_callback_data = btn_callback_data.decode('utf-8')
+                
                 if request.button_text:
                     if request.button_text.lower() in button.text.lower():
                         target_button = button
+                        target_callback_data = btn_callback_data
                         break
                 elif request.button_data:
-                    if button.callback_data == request.button_data:
+                    if btn_callback_data == request.button_data:
                         target_button = button
+                        target_callback_data = btn_callback_data
                         break
             if target_button:
                 break
@@ -448,7 +455,7 @@ async def click_button(
         callback_response = await app_client.request_callback_answer(
             chat_id=chat_id,
             message_id=request.message_id,
-            callback_data=target_button.callback_data,
+            callback_data=target_callback_data,
         )
         
         response_text = None
@@ -498,35 +505,51 @@ async def get_buttons(
         if not message:
             raise HTTPException(status_code=404, detail="Message not found")
         
-        if not message.reply_markup or not hasattr(message.reply_markup, 'inline_keyboard'):
-            return GetButtonsResponse(
-                success=True,
-                chat_id=chat_id,
-                message_id=message_id,
-                has_keyboard=False,
-                buttons=[],
-            )
+        if not message.reply_markup:
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "has_keyboard": False,
+                "buttons": [],
+                "note": "No reply_markup found in this message"
+            }
+        
+        if not hasattr(message.reply_markup, 'inline_keyboard'):
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "has_keyboard": False,
+                "buttons": [],
+                "note": "Message has reply_markup but no inline_keyboard"
+            }
         
         buttons = []
-        for row in message.reply_markup.inline_keyboard:
-            button_row = []
-            for button in row:
-                button_row.append(ButtonItem(
-                    text=button.text,
-                    callback_data=button.callback_data,
-                    url=button.url,
-                ))
-            buttons.append(button_row)
+        for row_index, row in enumerate(message.reply_markup.inline_keyboard):
+            for btn_index, button in enumerate(row):
+                callback_data = button.callback_data
+                if isinstance(callback_data, bytes):
+                    callback_data = callback_data.decode('utf-8')
+                
+                buttons.append({
+                    "row": row_index,
+                    "column": btn_index,
+                    "text": button.text,
+                    "callback_data": callback_data,
+                    "url": getattr(button, 'url', None)
+                })
         
-        logger.info(f"Fetched {len(buttons)} button rows from message {message_id} in chat {chat_id}")
+        logger.info(f"Fetched {len(buttons)} buttons from message {message_id} in chat {chat_id}")
         
-        return GetButtonsResponse(
-            success=True,
-            chat_id=chat_id,
-            message_id=message_id,
-            has_keyboard=True,
-            buttons=buttons,
-        )
+        return {
+            "success": True,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "has_keyboard": True,
+            "buttons": buttons,
+            "total_buttons": len(buttons)
+        }
     except HTTPException:
         raise
     except PeerIdInvalid:
