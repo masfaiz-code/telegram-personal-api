@@ -68,6 +68,22 @@ class SendMessageResponse(BaseModel):
     error: Optional[str] = None
 
 
+class ClickButtonRequest(BaseModel):
+    chat_id: str = Field(..., description="Chat ID or username of the bot")
+    message_id: int = Field(..., description="Message ID that contains the inline keyboard")
+    button_text: Optional[str] = Field(None, description="Button text to click (partial match)")
+    button_data: Optional[str] = Field(None, description="Button callback data (exact match)")
+
+
+class ClickButtonResponse(BaseModel):
+    success: bool
+    chat_id: str
+    message_id: int
+    button_clicked: Optional[str] = None
+    callback_response: Optional[str] = None
+    error: Optional[str] = None
+
+
 class FromUser(BaseModel):
     id: int
     username: Optional[str] = None
@@ -254,6 +270,7 @@ async def info():
             "GET /info": "API information",
             "POST /send-message": "Send Telegram message",
             "GET /get-messages": "Fetch chat history",
+            "POST /click-button": "Click inline keyboard button",
             "GET /get-chats": "List all chats/groups",
             "GET /me": "Get connected account info"
         },
@@ -342,6 +359,95 @@ async def send_message(
         raise HTTPException(status_code=401, detail="Session expired or invalid")
     except Exception as e:
         logger.error(f"Unexpected error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/click-button",
+    response_model=ClickButtonResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def click_button(
+    request: ClickButtonRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    if not request.button_text and not request.button_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Either button_text or button_data must be provided"
+        )
+    
+    try:
+        chat_id = request.chat_id
+        if chat_id.lstrip("-").isdigit():
+            chat_id = int(chat_id)
+        
+        messages = []
+        async for msg in app_client.get_chat_history(chat_id=chat_id, limit=10):
+            if msg.id == request.message_id:
+                messages.append(msg)
+                break
+        
+        if not messages:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        message = messages[0]
+        
+        if not message.reply_markup:
+            raise HTTPException(status_code=400, detail="Message has no inline keyboard")
+        
+        target_button = None
+        for row in message.reply_markup.inline_keyboard:
+            for button in row:
+                if request.button_text:
+                    if request.button_text.lower() in button.text.lower():
+                        target_button = button
+                        break
+                elif request.button_data:
+                    if button.callback_data == request.button_data:
+                        target_button = button
+                        break
+            if target_button:
+                break
+        
+        if not target_button:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Button not found: {request.button_text or request.button_data}"
+            )
+        
+        callback_response = await app_client.request_callback_answer(
+            chat_id=chat_id,
+            message_id=request.message_id,
+            callback_data=target_button.callback_data,
+        )
+        
+        response_text = None
+        if callback_response:
+            response_text = callback_response.message or callback_response.url
+        
+        logger.info(f"Clicked button '{target_button.text}' in chat {request.chat_id}")
+        
+        return ClickButtonResponse(
+            success=True,
+            chat_id=request.chat_id,
+            message_id=request.message_id,
+            button_clicked=target_button.text,
+            callback_response=response_text,
+        )
+    except HTTPException:
+        raise
+    except Flood as e:
+        logger.error(f"Flood wait: {e.value} seconds")
+        raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
+    except Exception as e:
+        logger.error(f"Error clicking button: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
