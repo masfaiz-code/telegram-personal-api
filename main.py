@@ -866,34 +866,9 @@ async def download_media(
         if not downloaded_file:
             raise HTTPException(status_code=404, detail="File not found or could not be downloaded")
         
-        # Get file info
-        file_info = await app_client.get_file(file_id)
-        
-        # Determine content type
+        # Default content type and filename
         content_type = "application/octet-stream"
-        if file_info and hasattr(file_info, 'mime_type') and file_info.mime_type:
-            content_type = file_info.mime_type
-        
-        # Get filename
-        filename = "downloaded_file"
-        if file_info and hasattr(file_info, 'file_name') and file_info.file_name:
-            filename = file_info.file_name
-        elif file_info and hasattr(file_info, 'file_unique_id'):
-            # Guess extension from mime type
-            ext = ""
-            if content_type == "image/jpeg":
-                ext = ".jpg"
-            elif content_type == "image/png":
-                ext = ".png"
-            elif content_type == "image/webp":
-                ext = ".webp"
-            elif content_type == "video/mp4":
-                ext = ".mp4"
-            elif content_type == "audio/mpeg":
-                ext = ".mp3"
-            elif content_type == "audio/ogg":
-                ext = ".ogg"
-            filename = f"{file_info.file_unique_id}{ext}"
+        filename = f"file_{file_id[:20]}"
         
         logger.info(f"Downloading media file: {filename} (file_id: {file_id[:20]}...)")
         
