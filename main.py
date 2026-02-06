@@ -850,11 +850,15 @@ async def get_chats(api_key: str = Depends(verify_api_key)):
 )
 async def download_media(
     file_id: str = Query(..., description="File ID of the media to download"),
+    file_name: Optional[str] = Query(None, description="Original file name (e.g., bmg2026cowa.gif)"),
+    mime_type: Optional[str] = Query(None, description="MIME type (e.g., image/gif, video/mp4)"),
     api_key: str = Depends(verify_api_key),
 ):
     """
     Download media file by file_id.
     Returns the file as a streaming response with appropriate content-type.
+    
+    Recommendation: Pass file_name and mime_type from get-messages response for correct file extension.
     """
     try:
         if not file_id:
@@ -866,11 +870,35 @@ async def download_media(
         if not downloaded_file:
             raise HTTPException(status_code=404, detail="File not found or could not be downloaded")
         
-        # Default content type and filename
-        content_type = "application/octet-stream"
-        filename = f"file_{file_id[:20]}"
+        # Use provided mime_type or default
+        content_type = mime_type if mime_type else "application/octet-stream"
         
-        logger.info(f"Downloading media file: {filename} (file_id: {file_id[:20]}...)")
+        # Use provided file_name or generate from file_id
+        if file_name:
+            filename = file_name
+        else:
+            # Try to guess extension from mime_type
+            ext = ".bin"
+            mime_to_ext = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/gif": ".gif",
+                "image/webp": ".webp",
+                "video/mp4": ".mp4",
+                "video/avi": ".avi",
+                "video/mov": ".mov",
+                "audio/mpeg": ".mp3",
+                "audio/ogg": ".ogg",
+                "audio/wav": ".wav",
+                "application/pdf": ".pdf",
+                "application/zip": ".zip",
+                "text/plain": ".txt",
+            }
+            if mime_type and mime_type in mime_to_ext:
+                ext = mime_to_ext[mime_type]
+            filename = f"file_{file_id[:20]}{ext}"
+        
+        logger.info(f"Downloading media file: {filename} (type: {content_type}, file_id: {file_id[:20]}...)")
         
         # Create streaming response
         return StreamingResponse(
