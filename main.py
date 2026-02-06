@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from pyrogram import Client
@@ -115,11 +116,25 @@ class MeResponse(BaseModel):
     phone_number: Optional[str] = None
 
 
+class MediaInfo(BaseModel):
+    type: str
+    file_id: Optional[str] = None
+    file_unique_id: Optional[str] = None
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+    file_size: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration: Optional[int] = None
+    caption: Optional[str] = None
+
+
 class MessageItem(BaseModel):
     message_id: int
     date: str
     text: Optional[str] = None
     from_user: Optional[FromUser] = None
+    media: Optional[MediaInfo] = None
 
 
 class GetMessagesResponse(BaseModel):
@@ -144,6 +159,171 @@ class GetChatsResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+def extract_media_info(message) -> Optional[MediaInfo]:
+    """Extract media information from a Pyrogram message."""
+    if not message.media:
+        return None
+    
+    media_type = None
+    file_id = None
+    file_unique_id = None
+    file_name = None
+    mime_type = None
+    file_size = None
+    width = None
+    height = None
+    duration = None
+    
+    # Handle different media types
+    if message.photo:
+        media_type = "photo"
+        # Get the largest photo size
+        photo = message.photo
+        file_id = photo.file_id
+        file_unique_id = photo.file_unique_id
+        file_size = photo.file_size
+        width = photo.width
+        height = photo.height
+    
+    elif message.video:
+        media_type = "video"
+        video = message.video
+        file_id = video.file_id
+        file_unique_id = video.file_unique_id
+        file_name = video.file_name
+        mime_type = video.mime_type
+        file_size = video.file_size
+        width = video.width
+        height = video.height
+        duration = video.duration
+    
+    elif message.animation:
+        media_type = "animation"  # GIF
+        animation = message.animation
+        file_id = animation.file_id
+        file_unique_id = animation.file_unique_id
+        file_name = animation.file_name
+        mime_type = animation.mime_type
+        file_size = animation.file_size
+        width = animation.width
+        height = animation.height
+        duration = animation.duration
+    
+    elif message.document:
+        media_type = "document"
+        document = message.document
+        file_id = document.file_id
+        file_unique_id = document.file_unique_id
+        file_name = document.file_name
+        mime_type = document.mime_type
+        file_size = document.file_size
+    
+    elif message.audio:
+        media_type = "audio"
+        audio = message.audio
+        file_id = audio.file_id
+        file_unique_id = audio.file_unique_id
+        file_name = audio.file_name
+        mime_type = audio.mime_type
+        file_size = audio.file_size
+        duration = audio.duration
+    
+    elif message.voice:
+        media_type = "voice"
+        voice = message.voice
+        file_id = voice.file_id
+        file_unique_id = voice.file_unique_id
+        mime_type = voice.mime_type
+        file_size = voice.file_size
+        duration = voice.duration
+    
+    elif message.video_note:
+        media_type = "video_note"
+        video_note = message.video_note
+        file_id = video_note.file_id
+        file_unique_id = video_note.file_unique_id
+        file_size = video_note.file_size
+        width = video_note.width
+        height = video_note.height
+        duration = video_note.duration
+    
+    elif message.sticker:
+        media_type = "sticker"
+        sticker = message.sticker
+        file_id = sticker.file_id
+        file_unique_id = sticker.file_unique_id
+        file_size = sticker.file_size
+        width = sticker.width
+        height = sticker.height
+        mime_type = "image/webp" if sticker.is_animated or sticker.is_video else "image/webp"
+    
+    elif message.contact:
+        media_type = "contact"
+        contact = message.contact
+        file_id = None  # Contacts don't have file_id
+        file_name = contact.first_name
+        if contact.last_name:
+            file_name += f" {contact.last_name}"
+        mime_type = "text/vcard"
+    
+    elif message.location:
+        media_type = "location"
+        location = message.location
+        file_id = None  # Locations don't have file_id
+        width = int(location.latitude * 1000000) if location.latitude else None
+        height = int(location.longitude * 1000000) if location.longitude else None
+    
+    elif message.venue:
+        media_type = "venue"
+        venue = message.venue
+        file_id = None
+        file_name = venue.title
+    
+    elif message.poll:
+        media_type = "poll"
+        poll = message.poll
+        file_id = poll.id
+        file_name = poll.question
+    
+    elif message.dice:
+        media_type = "dice"
+        dice = message.dice
+        file_id = None
+        file_name = f"{dice.emoji} - Value: {dice.value}"
+    
+    elif message.game:
+        media_type = "game"
+        game = message.game
+        file_id = None
+        file_name = game.title
+    
+    elif message.web_page:
+        media_type = "web_page"
+        web_page = message.web_page
+        file_id = None
+        file_name = web_page.title
+        mime_type = "text/html"
+        if web_page.photo:
+            width = web_page.photo.width
+            height = web_page.photo.height
+    
+    if media_type:
+        return MediaInfo(
+            type=media_type,
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            file_name=file_name,
+            mime_type=mime_type,
+            file_size=file_size,
+            width=width,
+            height=height,
+            duration=duration,
+            caption=message.caption
+        )
+    
+    return None
 
 
 async def cleanup_expired_tracking():
@@ -285,7 +465,8 @@ async def info():
             "GET /": "Interactive API documentation (Swagger)",
             "GET /info": "API information",
             "POST /send-message": "Send Telegram message",
-            "GET /get-messages": "Fetch chat history",
+            "GET /get-messages": "Fetch chat history with media support",
+            "GET /download-media": "Download media file by file_id",
             "POST /click-button": "Click inline keyboard button",
             "GET /get-buttons": "Get inline keyboard buttons from a message",
             "GET /get-chats": "List all chats/groups",
@@ -591,11 +772,16 @@ async def get_messages(
                     first_name=msg.from_user.first_name or "",
                     is_bot=msg.from_user.is_bot or False,
                 )
+            
+            # Extract media information
+            media_info = extract_media_info(msg)
+            
             messages.append(MessageItem(
                 message_id=msg.id,
                 date=msg.date.isoformat() if msg.date else "",
                 text=msg.text or msg.caption,
                 from_user=from_user,
+                media=media_info,
             ))
 
         logger.info(f"Fetched {len(messages)} messages from {chat_id}")
@@ -649,6 +835,84 @@ async def get_chats(api_key: str = Depends(verify_api_key)):
         raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
     except Exception as e:
         logger.error(f"Error fetching chats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/download-media",
+    responses={
+        401: {"model": ErrorResponse},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def download_media(
+    file_id: str = Query(..., description="File ID of the media to download"),
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Download media file by file_id.
+    Returns the file as a streaming response with appropriate content-type.
+    """
+    try:
+        if not file_id:
+            raise HTTPException(status_code=400, detail="file_id is required")
+        
+        # Download the file using Pyrogram
+        downloaded_file = await app_client.download_media(file_id, in_memory=True)
+        
+        if not downloaded_file:
+            raise HTTPException(status_code=404, detail="File not found or could not be downloaded")
+        
+        # Get file info
+        file_info = await app_client.get_file(file_id)
+        
+        # Determine content type
+        content_type = "application/octet-stream"
+        if file_info and hasattr(file_info, 'mime_type') and file_info.mime_type:
+            content_type = file_info.mime_type
+        
+        # Get filename
+        filename = "downloaded_file"
+        if file_info and hasattr(file_info, 'file_name') and file_info.file_name:
+            filename = file_info.file_name
+        elif file_info and hasattr(file_info, 'file_unique_id'):
+            # Guess extension from mime type
+            ext = ""
+            if content_type == "image/jpeg":
+                ext = ".jpg"
+            elif content_type == "image/png":
+                ext = ".png"
+            elif content_type == "image/webp":
+                ext = ".webp"
+            elif content_type == "video/mp4":
+                ext = ".mp4"
+            elif content_type == "audio/mpeg":
+                ext = ".mp3"
+            elif content_type == "audio/ogg":
+                ext = ".ogg"
+            filename = f"{file_info.file_unique_id}{ext}"
+        
+        logger.info(f"Downloading media file: {filename} (file_id: {file_id[:20]}...)")
+        
+        # Create streaming response
+        return StreamingResponse(
+            iter([downloaded_file.getvalue()]),
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Flood as e:
+        logger.error(f"Flood wait: {e.value} seconds")
+        raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
+    except Exception as e:
+        logger.error(f"Error downloading media: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
