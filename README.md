@@ -25,6 +25,8 @@
  WEBHOOK_INGEST_KEY=
  WEBHOOK_MODE=realtime
  MONITOR_CHAT_IDS=
+ PUBLIC_BASE_URL=
+ MEDIA_ACCESS_KEY=
  ```
  
  ### Cara Mendapatkan Credentials
@@ -82,10 +84,14 @@ Jika ingin mode realtime (tanpa polling), isi env:
 - `WEBHOOK_INGEST_KEY`: akan dikirim sebagai header `x-ingest-key`
 - `WEBHOOK_MODE`: `realtime` (default) atau `reply` (legacy)
 - `MONITOR_CHAT_IDS`: daftar chat id dipisah koma agar tidak semua chat diproses
+- `PUBLIC_BASE_URL`: base URL service ini (untuk generate `media_url` publik)
+- `MEDIA_ACCESS_KEY`: key query utk endpoint `/media-public`
 
 Payload realtime yang dikirim mencakup:
 - `source_chat_id`, `message_id`, `text/caption`, `post_url`
-- `media_type`, `media_file_id` (jika ada media)
+- `media_type`, `media_file_id`, `media_url` (jika ada media)
+
+Dengan `media_url`, worker tujuan bisa kirim `animation/gif` asli (bukan thumbnail JPG).
 
 ## API Endpoints
  
@@ -156,6 +162,8 @@ Payload realtime yang dikirim mencakup:
     - `WEBHOOK_INGEST_KEY` (opsional)
     - `WEBHOOK_MODE` (opsional, default `realtime`)
     - `MONITOR_CHAT_IDS` (opsional)
+    - `PUBLIC_BASE_URL` (opsional, wajib jika ingin kirim media_url)
+    - `MEDIA_ACCESS_KEY` (opsional, wajib jika ingin endpoint `/media-public`)
  6. Zeabur akan otomatis detect Python dan deploy
  
  ## Integrasi dengan N8N

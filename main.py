@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
 from collections import defaultdict
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Query
@@ -43,6 +44,8 @@ WEBHOOK_INGEST_KEY = os.getenv("WEBHOOK_INGEST_KEY", "")
 # - "realtime": forward pesan baru (disarankan utk monitoring channel)
 # - "reply": behavior lama (hanya reply ke pesan ter-track / akun sendiri)
 WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "realtime").strip().lower()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+MEDIA_ACCESS_KEY = os.getenv("MEDIA_ACCESS_KEY", "").strip()
 MONITOR_CHAT_IDS = os.getenv("MONITOR_CHAT_IDS", "")
 TRACK_EXPIRY_HOURS = int(os.getenv("TRACK_EXPIRY_HOURS", "24"))
 
@@ -371,6 +374,38 @@ def _build_post_url(message) -> Optional[str]:
     return None
 
 
+def _build_media_url(media: Optional[MediaInfo]) -> Optional[str]:
+    if not media or not media.file_id:
+        return None
+
+    if not PUBLIC_BASE_URL or not MEDIA_ACCESS_KEY:
+        return None
+
+    qs = {
+        "file_id": media.file_id,
+        "key": MEDIA_ACCESS_KEY,
+    }
+    if media.file_name:
+        qs["file_name"] = media.file_name
+    if media.mime_type:
+        qs["mime_type"] = media.mime_type
+
+    return f"{PUBLIC_BASE_URL}/media-public?{urlencode(qs)}"
+
+
+def _normalize_media_type(media: Optional[MediaInfo]) -> Optional[str]:
+    if not media:
+        return None
+    # map pyrogram types ke tipe yang dipakai worker
+    if media.type == "animation":
+        return "animation"
+    if media.type in ("video", "video_note"):
+        return "video"
+    if media.type in ("document", "audio", "voice"):
+        return "document"
+    return "photo"
+
+
 async def handle_incoming_message(client, message):
     global my_user_id
 
@@ -388,6 +423,8 @@ async def handle_incoming_message(client, message):
             return
 
         media = extract_media_info(message)
+        media_url = _build_media_url(media)
+        normalized_media_type = _normalize_media_type(media)
 
         payload = {
             "event": "new_message",
@@ -398,8 +435,9 @@ async def handle_incoming_message(client, message):
             "caption": message.caption,
             "post_url": _build_post_url(message),
             "date": message.date.isoformat() if message.date else "",
-            "media_type": media.type if media else None,
+            "media_type": normalized_media_type,
             "media_file_id": media.file_id if media else None,
+            "media_url": media_url,
             "chat": {
                 "id": chat_id,
                 "title": message.chat.title or message.chat.first_name or "Unknown",
@@ -518,7 +556,8 @@ async def info():
             "GET /info": "API information",
             "POST /send-message": "Send Telegram message",
             "GET /get-messages": "Fetch chat history with media support",
-            "GET /download-media": "Download media file by file_id",
+            "GET /download-media": "Download media file by file_id (Bearer auth)",
+            "GET /media-public": "Download media file by file_id (query key auth, for webhook worker)",
             "POST /click-button": "Click inline keyboard button",
             "GET /get-buttons": "Get inline keyboard buttons from a message",
             "GET /get-chats": "List all chats/groups",
@@ -892,6 +931,48 @@ async def get_chats(api_key: str = Depends(verify_api_key)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _download_media_internal(file_id: str, file_name: Optional[str], mime_type: Optional[str]):
+    if not file_id:
+        raise HTTPException(status_code=400, detail="file_id is required")
+
+    downloaded_file = await app_client.download_media(file_id, in_memory=True)
+    if not downloaded_file:
+        raise HTTPException(status_code=404, detail="File not found or could not be downloaded")
+
+    content_type = mime_type if mime_type else "application/octet-stream"
+
+    if file_name:
+        filename = file_name
+    else:
+        ext = ".bin"
+        mime_to_ext = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "video/mp4": ".mp4",
+            "video/avi": ".avi",
+            "video/mov": ".mov",
+            "audio/mpeg": ".mp3",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "application/pdf": ".pdf",
+            "application/zip": ".zip",
+            "text/plain": ".txt",
+        }
+        if mime_type and mime_type in mime_to_ext:
+            ext = mime_to_ext[mime_type]
+        filename = f"file_{file_id[:20]}{ext}"
+
+    logger.info(f"Downloading media file: {filename} (type: {content_type}, file_id: {file_id[:20]}...)")
+
+    return StreamingResponse(
+        iter([downloaded_file.getvalue()]),
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 @app.get(
     "/download-media",
     responses={
@@ -915,54 +996,7 @@ async def download_media(
     Recommendation: Pass file_name and mime_type from get-messages response for correct file extension.
     """
     try:
-        if not file_id:
-            raise HTTPException(status_code=400, detail="file_id is required")
-        
-        # Download the file using Pyrogram
-        downloaded_file = await app_client.download_media(file_id, in_memory=True)
-        
-        if not downloaded_file:
-            raise HTTPException(status_code=404, detail="File not found or could not be downloaded")
-        
-        # Use provided mime_type or default
-        content_type = mime_type if mime_type else "application/octet-stream"
-        
-        # Use provided file_name or generate from file_id
-        if file_name:
-            filename = file_name
-        else:
-            # Try to guess extension from mime_type
-            ext = ".bin"
-            mime_to_ext = {
-                "image/jpeg": ".jpg",
-                "image/png": ".png",
-                "image/gif": ".gif",
-                "image/webp": ".webp",
-                "video/mp4": ".mp4",
-                "video/avi": ".avi",
-                "video/mov": ".mov",
-                "audio/mpeg": ".mp3",
-                "audio/ogg": ".ogg",
-                "audio/wav": ".wav",
-                "application/pdf": ".pdf",
-                "application/zip": ".zip",
-                "text/plain": ".txt",
-            }
-            if mime_type and mime_type in mime_to_ext:
-                ext = mime_to_ext[mime_type]
-            filename = f"file_{file_id[:20]}{ext}"
-        
-        logger.info(f"Downloading media file: {filename} (type: {content_type}, file_id: {file_id[:20]}...)")
-        
-        # Create streaming response
-        return StreamingResponse(
-            iter([downloaded_file.getvalue()]),
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            }
-        )
-        
+        return await _download_media_internal(file_id, file_name, mime_type)
     except HTTPException:
         raise
     except Flood as e:
@@ -970,6 +1004,39 @@ async def download_media(
         raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
     except Exception as e:
         logger.error(f"Error downloading media: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/media-public",
+    responses={
+        401: {"model": ErrorResponse},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def media_public(
+    file_id: str = Query(..., description="File ID of the media to download"),
+    key: str = Query(..., description="Public media access key"),
+    file_name: Optional[str] = Query(None, description="Original file name"),
+    mime_type: Optional[str] = Query(None, description="MIME type"),
+):
+    if not MEDIA_ACCESS_KEY:
+        raise HTTPException(status_code=401, detail="MEDIA_ACCESS_KEY is not configured")
+    if key != MEDIA_ACCESS_KEY:
+        raise HTTPException(status_code=401, detail="Invalid media access key")
+
+    try:
+        return await _download_media_internal(file_id, file_name, mime_type)
+    except HTTPException:
+        raise
+    except Flood as e:
+        logger.error(f"Flood wait: {e.value} seconds")
+        raise HTTPException(status_code=429, detail=f"Rate limited. Please wait {e.value} seconds")
+    except Exception as e:
+        logger.error(f"Error downloading media (public): {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
