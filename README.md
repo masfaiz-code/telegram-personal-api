@@ -8,6 +8,7 @@
  - Authentication menggunakan Bearer token (API Key)
  - Production-ready dengan error handling lengkap
  - Siap deploy ke Zeabur, Railway, atau platform cloud lainnya
+- Realtime webhook mode untuk forward event pesan baru ke endpoint eksternal (mis. Cloudflare Worker)
  
  ## Environment Variables
  
@@ -18,6 +19,12 @@
  API_HASH=your_api_hash
  SESSION_STRING=your_session_string
  API_KEY=your_secret_api_key
+
+ # Realtime webhook (optional)
+ WEBHOOK_URL=
+ WEBHOOK_INGEST_KEY=
+ WEBHOOK_MODE=realtime
+ MONITOR_CHAT_IDS=
  ```
  
  ### Cara Mendapatkan Credentials
@@ -67,7 +74,20 @@
  uvicorn main:app --reload --host 0.0.0.0 --port 8000
  ```
  
- ## API Endpoints
+ ## Webhook Realtime (Opsional)
+
+Jika ingin mode realtime (tanpa polling), isi env:
+
+- `WEBHOOK_URL`: endpoint tujuan (contoh: `https://cf-worker-gempa-monitor.faaf.workers.dev/ingest/mtproto`)
+- `WEBHOOK_INGEST_KEY`: akan dikirim sebagai header `x-ingest-key`
+- `WEBHOOK_MODE`: `realtime` (default) atau `reply` (legacy)
+- `MONITOR_CHAT_IDS`: daftar chat id dipisah koma agar tidak semua chat diproses
+
+Payload realtime yang dikirim mencakup:
+- `source_chat_id`, `message_id`, `text/caption`, `post_url`
+- `media_type`, `media_file_id` (jika ada media)
+
+## API Endpoints
  
  ### Health Check
  ```
@@ -132,6 +152,10 @@
     - `API_HASH`
     - `SESSION_STRING`
     - `API_KEY`
+    - `WEBHOOK_URL` (opsional)
+    - `WEBHOOK_INGEST_KEY` (opsional)
+    - `WEBHOOK_MODE` (opsional, default `realtime`)
+    - `MONITOR_CHAT_IDS` (opsional)
  6. Zeabur akan otomatis detect Python dan deploy
  
  ## Integrasi dengan N8N

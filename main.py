@@ -38,6 +38,11 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 API_KEY = os.getenv("API_KEY")
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_INGEST_KEY = os.getenv("WEBHOOK_INGEST_KEY", "")
+# Mode:
+# - "realtime": forward pesan baru (disarankan utk monitoring channel)
+# - "reply": behavior lama (hanya reply ke pesan ter-track / akun sendiri)
+WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "realtime").strip().lower()
 MONITOR_CHAT_IDS = os.getenv("MONITOR_CHAT_IDS", "")
 TRACK_EXPIRY_HOURS = int(os.getenv("TRACK_EXPIRY_HOURS", "24"))
 
@@ -342,37 +347,84 @@ async def cleanup_expired_tracking():
 async def send_webhook(payload: dict):
     if not WEBHOOK_URL:
         return
+
+    headers = {}
+    if WEBHOOK_INGEST_KEY:
+        headers["x-ingest-key"] = WEBHOOK_INGEST_KEY
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(WEBHOOK_URL, json=payload)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(WEBHOOK_URL, json=payload, headers=headers)
             logger.info(f"Webhook sent: {response.status_code}")
     except Exception as e:
         logger.error(f"Webhook error: {e}")
 
 
+def _build_post_url(message) -> Optional[str]:
+    if getattr(message, "link", None):
+        return message.link
+
+    username = getattr(message.chat, "username", None)
+    if username:
+        return f"https://t.me/{username}/{message.id}"
+
+    return None
+
+
 async def handle_incoming_message(client, message):
     global my_user_id
-    
+
     if not WEBHOOK_URL:
         return
-    
+
     chat_id = message.chat.id
-    
     if monitor_chat_ids and chat_id not in monitor_chat_ids:
         return
-    
+
+    # MODE 1: realtime forward (disarankan utk monitoring channel)
+    if WEBHOOK_MODE != "reply":
+        content_text = message.text or message.caption
+        if not content_text:
+            return
+
+        media = extract_media_info(message)
+
+        payload = {
+            "event": "new_message",
+            "timestamp": datetime.now().isoformat(),
+            "source_chat_id": str(chat_id),
+            "message_id": message.id,
+            "text": message.text,
+            "caption": message.caption,
+            "post_url": _build_post_url(message),
+            "date": message.date.isoformat() if message.date else "",
+            "media_type": media.type if media else None,
+            "media_file_id": media.file_id if media else None,
+            "chat": {
+                "id": chat_id,
+                "title": message.chat.title or message.chat.first_name or "Unknown",
+                "type": str(message.chat.type).split(".")[-1].lower() if message.chat.type else "unknown",
+                "username": message.chat.username,
+            },
+        }
+
+        logger.info(f"New message detected in chat {chat_id}, forwarding to webhook")
+        await send_webhook(payload)
+        return
+
+    # MODE 2: reply-only (legacy behavior)
     if not message.reply_to_message:
         return
-    
+
     reply_to_id = message.reply_to_message.id
     reply_to_user_id = message.reply_to_message.from_user.id if message.reply_to_message.from_user else None
-    
+
     is_reply_to_tracked = any(mid == reply_to_id for mid, ts in tracked_messages.get(chat_id, []))
     is_reply_to_me = reply_to_user_id == my_user_id
-    
+
     if not (is_reply_to_tracked or is_reply_to_me):
         return
-    
+
     payload = {
         "event": "reply_received",
         "timestamp": datetime.now().isoformat(),
@@ -402,7 +454,7 @@ async def handle_incoming_message(client, message):
             }
         }
     }
-    
+
     logger.info(f"Reply detected in chat {chat_id}, forwarding to webhook")
     await send_webhook(payload)
 
@@ -474,7 +526,9 @@ async def info():
         },
         "webhook": {
             "enabled": bool(WEBHOOK_URL),
-            "monitored_chats": monitor_chat_ids or "all"
+            "mode": WEBHOOK_MODE,
+            "monitored_chats": monitor_chat_ids or "all",
+            "ingest_key_header_enabled": bool(WEBHOOK_INGEST_KEY)
         },
         "authentication": "Bearer token required for all endpoints except /",
         "github": "https://github.com/masfaiz-code/telegram-personal-api"
